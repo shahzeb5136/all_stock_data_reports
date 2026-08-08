@@ -1,0 +1,29 @@
+# The price history is 250MB and is rebuilt on the Railway volume at boot.
+# Shipping it in the image would balloon every deploy.
+reports/stock_prices.csv
+*.csv
+
+# Generated artifacts — rebuilt on every run.
+reports/charts/
+charts/
+*.pdf
+*.png
+
+# Local tooling
+venv/
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+
+# Secrets and local config
+.env
+.env.*
+!.env.example
+
+# Windows / Google Drive cruft
+desktop.ini
+*.bat
+.git/
+.gitignore

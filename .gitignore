@@ -1,0 +1,43 @@
+# ── Price data ──────────────────────────────────────────────────────────────
+# stock_prices.csv is ~250MB and is rebuilt on the Railway volume at boot.
+# GitHub rejects files over 100MB, and it is regenerable data, not source.
+*.csv
+*.tsv
+
+# ── Generated report artifacts ──────────────────────────────────────────────
+# PDFs and chart PNGs are rebuilt on every run.
+*.pdf
+charts/
+reports/charts/
+*.png
+
+# ── Local service state ─────────────────────────────────────────────────────
+data/
+*.db
+*.sqlite
+*.sqlite3
+
+# ── Secrets ─────────────────────────────────────────────────────────────────
+# Never commit real credentials. .env.example holds placeholders only.
+.env
+.env.*
+!.env.example
+
+# ── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+venv/
+.venv/
+env/
+
+# ── Editor / OS ─────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Google Drive folder metadata
+desktop.ini

@@ -1,0 +1,21 @@
+# ── Price data + analysis ───────────────────────────────────────────────────
+yfinance>=0.2.30
+pandas>=2.0.0
+numpy>=1.26.0
+scipy>=1.11.0
+
+# ── Report rendering ────────────────────────────────────────────────────────
+matplotlib>=3.8.0
+reportlab>=4.0.0
+Pillow>=10.0.0          # reportlab needs this to embed the chart PNGs
+
+# ── API service ─────────────────────────────────────────────────────────────
+fastapi>=0.115.0
+uvicorn[standard]>=0.34.0
+pydantic>=2.0.0
+python-dotenv>=1.0.0
+
+# ── Auth / storage / database ───────────────────────────────────────────────
+PyJWT[crypto]>=2.9.0    # Clerk JWT verification
+psycopg2-binary>=2.9.0  # shared Railway Postgres (credits)
+boto3>=1.35.0           # Cloudflare R2 (S3-compatible)
