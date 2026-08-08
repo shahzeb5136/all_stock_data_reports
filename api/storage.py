@@ -56,6 +56,46 @@ def upload_pack_file(snapshot_date: str, pack_id: str, file_path: Path) -> str:
     return key
 
 
+def object_exists(key: str) -> bool:
+    """True if an object is present in the bucket."""
+    from botocore.exceptions import ClientError
+
+    try:
+        _client().head_object(Bucket=_bucket(), Key=key)
+        return True
+    except ClientError as exc:
+        if exc.response.get("Error", {}).get("Code") in ("404", "NoSuchKey", "NotFound"):
+            return False
+        raise
+
+
+def download_to_file(key: str, dest: Path) -> int:
+    """Download an object to a local path. Returns its size in bytes.
+
+    Writes to a temporary file first so an interrupted transfer cannot leave
+    a truncated price CSV that later looks complete.
+    """
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    tmp = dest.with_suffix(dest.suffix + ".part")
+
+    _client().download_file(_bucket(), key, str(tmp))
+    tmp.replace(dest)
+    return dest.stat().st_size
+
+
+def upload_file(key: str, source: Path) -> int:
+    """Upload a local file under an explicit key. Returns its size in bytes.
+
+    boto3 switches to multipart automatically, so this handles the ~250MB
+    price CSV without special handling.
+    """
+    content_type = _CONTENT_TYPES.get(source.suffix.lower(), "application/octet-stream")
+    _client().upload_file(
+        str(source), _bucket(), key, ExtraArgs={"ContentType": content_type}
+    )
+    return source.stat().st_size
+
+
 def get_download_url(key: str, filename: str | None = None) -> str:
     """Presigned GET URL for an R2 object.
 

@@ -28,12 +28,14 @@ from api.builder import REPORT_CATALOGUE
 from api.database import InsufficientCredits
 from api.settings import (
     ADMIN_SECRET_KEY,
+    CSV_PATH,
     PACK_CREDIT_COST,
     SCHEDULER_ENABLED,
+    SEED_CSV_R2_KEY,
     allowed_origins,
     ensure_dirs,
 )
-from api.storage import get_download_url
+from api.storage import get_download_url, upload_file
 
 logger = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -309,11 +311,34 @@ async def admin_packs(key: str, limit: int = 25):
 async def admin_status(key: str):
     require_admin(key)
     latest = database.get_latest_ready_pack()
+    csv_exists = CSV_PATH.exists()
     return {
         "scheduler": scheduler.get_state(),
         "latest_pack": _pack_summary(latest) if latest else None,
         "credit_cost": PACK_CREDIT_COST,
+        "price_csv": {
+            "path": str(CSV_PATH),
+            "exists": csv_exists,
+            "megabytes": round(CSV_PATH.stat().st_size / (1024 * 1024), 1) if csv_exists else 0,
+        },
     }
+
+
+@app.post("/api/admin/seed/backup")
+async def admin_seed_backup(key: str):
+    """Snapshot the volume's price CSV to R2 as the restore seed.
+
+    Refreshing this occasionally means a rebuilt volume has less history to
+    catch up on. Takes a minute or so — it uploads ~250MB.
+    """
+    require_admin(key)
+
+    if not CSV_PATH.exists() or CSV_PATH.stat().st_size == 0:
+        raise HTTPException(status_code=409, detail="No price CSV on the volume yet")
+
+    size = upload_file(SEED_CSV_R2_KEY, CSV_PATH)
+    logger.info("Seed backed up: %.1f MB → %s", size / (1024 * 1024), SEED_CSV_R2_KEY)
+    return {"key": SEED_CSV_R2_KEY, "bytes": size, "megabytes": round(size / (1024 * 1024), 1)}
 
 
 @app.post("/api/admin/build")

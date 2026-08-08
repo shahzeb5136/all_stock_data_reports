@@ -27,20 +27,62 @@ MANIFEST_SENTINEL = "__PACK_MANIFEST__"
 logger = logging.getLogger("build_pack")
 
 
+def _restore_seed(csv_path: Path) -> bool:
+    """Restore the price CSV from the R2 seed object. True if restored.
+
+    This is what keeps a cold volume off the bulk-download path: the seed
+    carries the twenty years of history that were downloaded once, and the
+    incremental update afterwards only has to close the gap since then.
+    """
+    from api.settings import SEED_CSV_R2_KEY
+    from api.storage import download_to_file, object_exists
+
+    try:
+        if not object_exists(SEED_CSV_R2_KEY):
+            logger.warning("No seed object at r2://%s", SEED_CSV_R2_KEY)
+            return False
+    except Exception:
+        logger.exception("Could not check for the seed object")
+        return False
+
+    logger.info("Restoring price history from r2://%s", SEED_CSV_R2_KEY)
+    size = download_to_file(SEED_CSV_R2_KEY, csv_path)
+    logger.info("Seed restored: %.1f MB at %s", size / (1024 * 1024), csv_path)
+    return True
+
+
 def refresh_prices(csv_path: Path) -> None:
     """Bring the local price CSV up to date.
 
-    A missing CSV means this is a cold volume, so it does the full history
-    load; otherwise it fetches only the days each ticker is missing.
+    On a warm volume this is just an incremental update.  On a cold one it
+    restores the seed from R2 first, then updates — so Yahoo Finance is only
+    ever asked for the days actually missing, never the full history.
     """
     # Imported here so a --skip-refresh build never pays the yfinance import.
     from downloader import bulk_download, smart_update
 
     if not csv_path.exists() or csv_path.stat().st_size == 0:
-        logger.info("No price CSV at %s — running full historical download", csv_path)
-        summary = bulk_download()
-        logger.info("Bulk download complete: %s", summary)
-        return
+        logger.info("No price CSV at %s — cold volume", csv_path)
+
+        if not _restore_seed(csv_path):
+            from api.settings import ALLOW_BULK_SEED, SEED_CSV_R2_KEY
+
+            if not ALLOW_BULK_SEED:
+                raise RuntimeError(
+                    f"No price CSV on the volume and no seed at r2://{SEED_CSV_R2_KEY}. "
+                    "Upload your existing stock_prices.csv with "
+                    "`python scripts/seed_upload.py`, or set ALLOW_BULK_SEED=true to "
+                    "download twenty years of history from Yahoo Finance instead "
+                    "(slow, and likely to be rate limited from a datacenter IP)."
+                )
+
+            logger.warning(
+                "ALLOW_BULK_SEED is set — downloading full history for every ticker. "
+                "This is slow and may be throttled by Yahoo Finance."
+            )
+            summary = bulk_download()
+            logger.info("Bulk download complete: %s", summary)
+            return
 
     logger.info("Updating price CSV at %s", csv_path)
     summary = smart_update()

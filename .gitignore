@@ -23,6 +23,10 @@ data/
 .env.*
 !.env.example
 
+# Local notes that hold real values (e.g. RAILWAY_SETUP.local.md).
+*.local.md
+*.local.txt
+
 # ── Python ──────────────────────────────────────────────────────────────────
 __pycache__/
 *.py[cod]

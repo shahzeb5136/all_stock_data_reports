@@ -27,6 +27,19 @@ SQLITE_PATH = DATA_DIR / "reports_service.db"
 # Scratch space for a pack build before its PDFs are uploaded to R2.
 PACK_WORK_DIR = DATA_DIR / "packs"
 
+# ── Price data seeding ───────────────────────────────────────────────────────
+
+# R2 object holding a snapshot of stock_prices.csv.  On a cold volume the
+# service restores this and then does a normal incremental update, instead of
+# re-downloading twenty years of history from Yahoo Finance.
+SEED_CSV_R2_KEY = os.getenv("SEED_CSV_R2_KEY", "seed/stock_prices.csv")
+
+# Permit a full historical download when no seed exists.  Off by default: a
+# 20-year, 500-ticker bulk pull from a datacenter IP is exactly the thing
+# Yahoo Finance throttles, and silently falling back to it would turn a
+# missing seed into hours of rate-limited requests.
+ALLOW_BULK_SEED = os.getenv("ALLOW_BULK_SEED", "false").lower() == "true"
+
 # ── Pricing ──────────────────────────────────────────────────────────────────
 
 # Credits burned per report pack. Kept configurable so the two products on the

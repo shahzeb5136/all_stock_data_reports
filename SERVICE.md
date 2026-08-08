@@ -51,21 +51,57 @@ The analysers in `reports/` are **not modified** — `builder.py` imports them a
 calls their existing functions, so `python reports/dip_analyzer.py` locally and
 the hosted service produce the same PDFs from the same code.
 
+## Price data: seed once, then incremental forever
+
+The service never bulk-downloads history. Twenty years of daily bars for
+hundreds of tickers is exactly the request Yahoo Finance throttles, and it
+throttles a datacenter IP far harder than a residential one.
+
+Instead the existing CSV is uploaded to R2 once as a **seed**. On a cold
+volume the service restores it and then runs the normal incremental update,
+so Yahoo is only ever asked for the days actually missing:
+
+```
+  cold volume ──► restore r2://<bucket>/seed/stock_prices.csv
+                        │
+                        └─► smart_update()   only the gap since the seed
+  warm volume ──► smart_update()             only the gap since yesterday
+```
+
+Upload the seed **before the first deploy**:
+
+```bash
+python scripts/seed_upload.py                 # uses reports/stock_prices.csv
+```
+
+If no seed exists, a build **fails with an explanatory error rather than
+falling back to a bulk download**. Setting `ALLOW_BULK_SEED=true` opts into
+the slow path deliberately; there is no way to trigger it by accident.
+
+Refresh the seed occasionally so a rebuilt volume has less to catch up on:
+
+```bash
+curl -X POST "https://<service>/api/admin/seed/backup?key=<ADMIN_SECRET_KEY>"
+```
+
 ## Deploying to Railway
 
-1. **New service** from this repo. `railway.json` selects the Dockerfile.
+1. **Upload the seed** (above). Do this first.
 
-2. **Attach a volume mounted at `/data`.** Required — it holds the 250MB price
-   CSV and the service SQLite DB. Without it, every redeploy re-downloads
-   twenty years of history. 5GB is plenty.
+2. **New service** from this repo. `railway.json` selects the Dockerfile.
 
-3. **Reference the existing Postgres** so credits are the shared wallet:
+3. **Attach a volume mounted at `/data`.** Required — it holds the price CSV
+   and the service SQLite DB. 5GB is plenty. Note the path is `/data`; if you
+   run another service with a different mount point, do not copy its
+   `DATA_DIR` value here.
+
+4. **Reference the existing Postgres** so credits are the shared wallet:
    ```
    DATABASE_URL=${{Postgres.DATABASE_URL}}
    ```
    Use the variable reference, not a pasted URL, so it survives rotation.
 
-4. **Set the remaining variables** (see `.env.example`):
+5. **Set the remaining variables** (see `.env.example`):
    `CLERK_JWKS_URL`, `R2_ACCOUNT_ID`, `R2_ACCESS_KEY_ID`,
    `R2_SECRET_ACCESS_KEY`, `R2_BUCKET_NAME`, `ADMIN_SECRET_KEY`,
    `FRONTEND_URL`.
@@ -73,13 +109,13 @@ the hosted service produce the same PDFs from the same code.
    `CLERK_JWKS_URL` **must be the same Clerk application as trading_agents** —
    that is what makes the user IDs match and the credit wallet shared.
 
-5. **First boot** downloads the full history and builds the first pack. Expect
-   10–20 minutes. The API is live and healthy throughout; `/api/reports/latest`
-   returns `pack: null, building: true` until it finishes.
+6. **First boot** restores the seed, closes the gap, and builds the first pack
+   — a few minutes. The API is live and healthy throughout;
+   `/api/reports/latest` returns `pack: null, building: true` until it lands.
 
-Create the R2 bucket first (`stock-reports`, or whatever you set
-`R2_BUCKET_NAME` to). Keep it private — the service hands out short-lived
-presigned URLs rather than public links.
+The R2 bucket must exist and should stay private — the service hands out
+short-lived presigned URLs rather than public links. Sharing a bucket with
+another service is fine: keys here live under `packs/` and `seed/`.
 
 ### Environment variables
 
@@ -92,6 +128,8 @@ presigned URLs rather than public links.
 | `ADMIN_SECRET_KEY` | — | Protects `/api/admin/*`. Long random string |
 | `FRONTEND_URL` | `http://localhost:3000` | CORS origin |
 | `EXTRA_CORS_ORIGINS` | — | Comma-separated extras (preview deploys, www vs apex) |
+| `SEED_CSV_R2_KEY` | `seed/stock_prices.csv` | Where the price-history seed lives |
+| `ALLOW_BULK_SEED` | `false` | Permit a full Yahoo download when no seed exists |
 | `PACK_CREDIT_COST` | `1` | Credits per pack |
 | `BUILD_HOUR_UTC` | `22` | ~6pm ET, after the US close |
 | `BUILD_ON_BOOT` | `true` | Build immediately if no pack is ready |
@@ -193,6 +231,7 @@ the user does not own it.
 | `GET /api/admin/users` | All users and balances |
 | `POST /api/admin/credits` | `{"user_id": "...", "amount": 5}` — grant credits |
 | `POST /api/admin/build` | Force a rebuild now |
+| `POST /api/admin/seed/backup` | Snapshot the volume's price CSV to R2 as the seed |
 
 `POST /api/admin/build?key=…&skip_refresh=true` rebuilds the PDFs from the
 price CSV as it stands, without hitting Yahoo Finance. That is the fast way to
