@@ -26,5 +26,8 @@ RUN mkdir -p /data /tmp/matplotlib
 
 EXPOSE 8000
 
-# Railway injects PORT; the default keeps `docker run` working locally.
+# Shell form on purpose: ${PORT} must be expanded by a shell. Do NOT set a
+# startCommand in railway.json — Railway execs that without a shell, so "$PORT"
+# would reach uvicorn as a literal string and it would refuse to start.
+# The default keeps `docker run` working locally, where PORT is unset.
 CMD ["sh", "-c", "uvicorn api.main:app --host 0.0.0.0 --port ${PORT:-8000}"]
