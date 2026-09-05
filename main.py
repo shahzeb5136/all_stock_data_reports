@@ -85,7 +85,8 @@ def cmd_repair(tickers: list):
         return
 
     print(f"\n  Split-shaped seams  : {result.get('candidates', 0)}")
-    print(f"  Refetched to verify : {result.get('tickers_checked', 0)}")
+    print(f"  Refetched to verify : {result.get('tickers_checked', 0)} ticker(s) "
+          f"in {result.get('requests', 0)} request(s)")
     print(f"  Stale histories     : {', '.join(result.get('stale_found', [])) or 'none'}")
     print(f"  Repaired            : {', '.join(result.get('repaired', [])) or 'none'}")
     if result.get("quarantined"):

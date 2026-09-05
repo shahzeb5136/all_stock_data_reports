@@ -32,6 +32,16 @@ genuine crash reproduces exactly, while a stale scale shows up as the split
 ratio itself. Verified-clean seams are cached, so a stock's crash is checked
 once and never again, keeping steady-state traffic near zero.
 
+Verification is the stage most exposed to throttling — it runs before any
+repair, and on a cold cache it has the whole candidate list to get through —
+so it is batched through the downloader's retrying batch path rather than
+fetching a ticker at a time. A universe-wide sweep costs a handful of requests
+instead of one per candidate, and inherits retry, backoff and the per-ticker
+fallback. A batch that still cannot be settled leaves those tickers untouched
+and reported, not quarantined: most candidates are genuine crashes, and
+dropping them on a failed request would silently bury exactly the dips these
+reports exist to surface. They are re-detected and retried on the next run.
+
 An earlier version of this matched seams against Yahoo's split calendar
 instead. It does not work, and the reason is worth recording: the seam does
 *not* sit on the split date. It sits at the boundary of the last incremental
@@ -60,9 +70,11 @@ import pandas as pd
 
 from config import (
     CSV_PATH,
+    SLEEP_BETWEEN_BATCHES_UPDATE,
     SPLIT_CLEAN_CACHE_DAYS,
     SPLIT_SCAN_LOOKBACK_ROWS,
     SPLIT_SEAM_BAND,
+    SPLIT_VERIFY_BATCH_SIZE,
     SPLIT_VERIFY_SLEEP,
     SPLIT_VERIFY_TOLERANCE,
     SPLIT_VERIFY_WINDOW_DAYS,
@@ -226,32 +238,51 @@ def find_seam_candidates(
 # STAGE 2 — REFETCH THE SEAM AND COMPARE
 # ─────────────────────────────────────────────
 
-def _fetch_closes(ticker: str, start: str, end: str) -> dict:
-    """
-    {'YYYY-MM-DD': close} for a short window, on today's adjustment basis.
+def _chunked(items: list, size: int):
+    """Yield successive size-length chunks from items."""
+    for i in range(0, len(items), size):
+        yield items[i:i + size]
 
-    Raises on a failed request, so the caller can tell an empty window from a
-    request that never landed.
-    """
-    import yfinance as yf  # imported lazily: the analysers import this module
 
-    raw = yf.download(
-        ticker, start=start, end=end,
-        auto_adjust=True, progress=False, threads=False,
+def _default_fetcher(tickers: list, start: str, end: str) -> pd.DataFrame:
+    """
+    Fetch daily bars for a group of tickers in one call, with retries.
+
+    Deliberately reuses the downloader's batch path rather than calling
+    yfinance directly: that is where the retry/backoff and the per-ticker
+    fallback already live, and verification is the stage most exposed to
+    throttling — it runs before any repair, on a cold cache.
+
+    The import is lazy because downloader imports this module at load time.
+    Doing it here breaks the cycle, and keeps yfinance out of the analysers,
+    which import split_guard only for load_quarantine().
+    """
+    from downloader import _download_batch_with_retry
+
+    frame, _failed = _download_batch_with_retry(
+        tickers, start, end,
+        label=f"split verify {tickers[0]}..{tickers[-1]}",
+        sleep_seconds=SLEEP_BETWEEN_BATCHES_UPDATE,
     )
-    if raw is None or raw.empty or "Close" not in raw:
-        return {}
+    return frame
 
-    closes = raw["Close"]
-    if isinstance(closes, pd.DataFrame):
-        # Recent yfinance returns MultiIndex columns even for one ticker.
-        closes = closes.iloc[:, 0]
 
-    return {
-        pd.Timestamp(stamp).strftime("%Y-%m-%d"): float(value)
-        for stamp, value in closes.items()
-        if pd.notna(value) and float(value) > 0
-    }
+def _closes_by_ticker(frame: pd.DataFrame) -> dict:
+    """{ticker: {'YYYY-MM-DD': close}} from a long-format price frame."""
+    lookup: dict = {}
+    if frame is None or frame.empty:
+        return lookup
+    for row in frame.itertuples(index=False):
+        close = getattr(row, "close", None)
+        if close is None or pd.isna(close) or float(close) <= 0:
+            continue
+        lookup.setdefault(row.ticker, {})[str(row.date)] = float(close)
+    return lookup
+
+
+def _pad(day: str, days: int, sign: int) -> str:
+    """Shift a date string by `days`, so a window survives weekends/holidays."""
+    return (pd.Timestamp(day) + sign * timedelta(days=days)).strftime("%Y-%m-%d")
 
 
 def _verify_seam(seam: dict, fresh: dict) -> tuple:
@@ -280,86 +311,102 @@ def _verify_seam(seam: dict, fresh: dict) -> tuple:
     return "stale", scale
 
 
-def confirm_split_seams(candidates: list, csv_path: str = CSV_PATH) -> dict:
+def confirm_split_seams(candidates: list, csv_path: str = CSV_PATH,
+                        fetcher=None) -> dict:
     """
-    Refetch each candidate seam and decide whether the stored history is stale.
+    Refetch the candidate seams and decide which stored histories are stale.
+
+    Tickers are verified in batches, not one at a time. Each batch is a single
+    request covering every seam in it, so a universe-wide sweep costs a handful
+    of requests rather than one per candidate — verification runs before any
+    repair and on a cold cache, so it is the stage most likely to be throttled,
+    and the cheapest place to spend fewer requests.
+
+    ``fetcher(tickers, start, end) -> long-format frame`` is injectable for
+    tests; the default goes through the downloader's retrying batch path.
 
     Returns {'confirmed': [seams + scale],
              'unverified': [tickers we could not settle],
-             'checked': number of tickers actually queried}
+             'checked': tickers covered by a fetch,
+             'requests': batches actually issued}
     """
+    empty = {"confirmed": [], "unverified": [], "checked": 0, "requests": 0}
     if not candidates:
-        return {"confirmed": [], "unverified": [], "checked": 0}
+        return empty
 
     cache = _load_cache(csv_path)
-    by_ticker: dict = {}
+
+    # Drop anything already settled as a genuine price move on an earlier run.
+    pending: dict = {}
     for seam in candidates:
-        by_ticker.setdefault(seam["ticker"], []).append(seam)
-
-    confirmed, unverified, checked = [], [], 0
-
-    for ticker, seams in sorted(by_ticker.items()):
-        pending = [
-            s for s in seams
-            if not _cache_is_fresh(cache.get(f"{ticker}@{s['date']}", {}))
-        ]
-        if not pending:
+        if _cache_is_fresh(cache.get(f"{seam['ticker']}@{seam['date']}", {})):
             continue
+        pending.setdefault(seam["ticker"], []).append(seam)
 
-        settled = False
-        for seam in pending:
-            # Repair rewrites the whole ticker, so stop at the first seam that
-            # proves the history is stale rather than pricing out every one.
-            if settled:
-                break
+    if not pending:
+        return empty
 
-            window = (
-                (pd.Timestamp(seam["prev_date"]) - timedelta(days=SPLIT_VERIFY_WINDOW_DAYS))
-                .strftime("%Y-%m-%d"),
-                (pd.Timestamp(seam["date"]) + timedelta(days=SPLIT_VERIFY_WINDOW_DAYS))
-                .strftime("%Y-%m-%d"),
-            )
-            try:
-                fresh = _fetch_closes(ticker, *window)
-                checked += 1
-            except Exception as e:
-                log.warning(f"{ticker}: could not refetch {seam['date']} ({e})")
-                unverified.append(ticker)
-                break
-            finally:
+    fetcher = fetcher or _default_fetcher
+    confirmed, unverified, checked, requests = [], [], 0, 0
+    batches = list(_chunked(sorted(pending), SPLIT_VERIFY_BATCH_SIZE))
+
+    for batch_no, batch in enumerate(batches, 1):
+        seams = [s for ticker in batch for s in pending[ticker]]
+        start = _pad(min(s["prev_date"] for s in seams), SPLIT_VERIFY_WINDOW_DAYS, -1)
+        end = _pad(max(s["date"] for s in seams), SPLIT_VERIFY_WINDOW_DAYS, +1)
+
+        try:
+            frame = fetcher(batch, start, end)
+            requests += 1
+        except Exception as e:
+            log.warning(f"Split guard: verification batch {batch_no}/{len(batches)} "
+                        f"failed ({e}) - {len(batch)} ticker(s) left unsettled")
+            unverified.extend(batch)
+            continue
+        finally:
+            if batch_no < len(batches):
                 time.sleep(SPLIT_VERIFY_SLEEP)  # gentle on Yahoo's rate limits
 
-            verdict, scale = _verify_seam(seam, fresh)
+        fresh_by_ticker = _closes_by_ticker(frame)
+        checked += len(batch)
 
-            if verdict == "unknown":
-                log.warning(f"{ticker}: no fresh bars for {seam['prev_date']} to "
-                            f"{seam['date']}, cannot settle this seam")
-                unverified.append(ticker)
-                continue
+        for ticker in batch:
+            fresh = fresh_by_ticker.get(ticker, {})
+            for seam in pending[ticker]:
+                verdict, scale = _verify_seam(seam, fresh)
 
-            if verdict == "clean":
-                # A real price move. Remember it, so the next run does not
-                # spend a request asking the same question again.
-                cache[f"{ticker}@{seam['date']}"] = {
-                    "verdict": "clean",
-                    "checked": datetime.today().strftime("%Y-%m-%d"),
-                    "ratio": seam["ratio"],
-                }
-                continue
+                if verdict == "unknown":
+                    log.warning(f"{ticker}: no fresh bars for {seam['prev_date']} "
+                                f"to {seam['date']}, cannot settle this seam")
+                    unverified.append(ticker)
+                    continue
 
-            log.warning(
-                f"{ticker}: history is on a stale adjustment scale - the "
-                f"{(seam['ratio'] - 1) * 100:+.1f}% jump stored for "
-                f"{seam['date']} is off by {scale:.4g}x against a fresh fetch"
-            )
-            confirmed.append({**seam, "scale": round(float(scale), 6)})
-            settled = True
+                if verdict == "clean":
+                    # A real price move. Remember it, so the next run does not
+                    # spend a request asking the same question again.
+                    cache[f"{ticker}@{seam['date']}"] = {
+                        "verdict": "clean",
+                        "checked": datetime.today().strftime("%Y-%m-%d"),
+                        "ratio": seam["ratio"],
+                    }
+                    continue
+
+                log.warning(
+                    f"{ticker}: history is on a stale adjustment scale - the "
+                    f"{(seam['ratio'] - 1) * 100:+.1f}% jump stored for "
+                    f"{seam['date']} is off by {scale:.4g}x against a fresh fetch"
+                )
+                confirmed.append({**seam, "scale": round(float(scale), 6)})
+                # Repair rewrites the ticker's whole history, so one proven
+                # seam is enough — no need to price out the rest.
+                break
 
     _save_cache(cache, csv_path)
     return {
         "confirmed": confirmed,
         "unverified": sorted(set(unverified) - {c["ticker"] for c in confirmed}),
         "checked": checked,
+        "requests": requests,
     }
 
 
@@ -372,13 +419,13 @@ def scan_for_stale_splits(
     Run both stages over a price frame.
 
     Returns {'candidates': int, 'confirmed': [...], 'tickers': [...],
-             'unverified': [...], 'checked': int}
+             'unverified': [...], 'checked': int, 'requests': int}
     """
     candidates = find_seam_candidates(df, lookback_rows=lookback_rows)
     if not candidates:
         log.info("Split guard: no split-shaped seams in the scanned window")
         return {"candidates": 0, "confirmed": [], "tickers": [],
-                "unverified": [], "checked": 0}
+                "unverified": [], "checked": 0, "requests": 0}
 
     log.info(
         f"Split guard: {len(candidates)} split-shaped seam(s) across "
@@ -388,12 +435,20 @@ def scan_for_stale_splits(
     result = confirm_split_seams(candidates, csv_path=csv_path)
     tickers = sorted({s["ticker"] for s in result["confirmed"]})
 
+    log.info(f"Split guard: verified {result['checked']} ticker(s) in "
+             f"{result['requests']} request(s)")
+
     if tickers:
         log.warning(f"Split guard: {len(tickers)} ticker(s) need repair: {tickers}")
     else:
-        log.info(
-            f"Split guard: no stale splits ({result['checked']} ticker(s) "
-            f"queried, the rest cached or genuine price moves)"
+        log.info("Split guard: no stale splits - every seam checked out as a "
+                 "genuine price move, or was already cached as one")
+
+    if result["unverified"]:
+        log.warning(
+            f"Split guard: {len(result['unverified'])} ticker(s) could not be "
+            f"settled this run and stay in the reports unchanged; they are "
+            f"retried next run: {result['unverified']}"
         )
 
     return {
@@ -402,4 +457,5 @@ def scan_for_stale_splits(
         "tickers": tickers,
         "unverified": result["unverified"],
         "checked": result["checked"],
+        "requests": result["requests"],
     }

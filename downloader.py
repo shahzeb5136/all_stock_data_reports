@@ -781,6 +781,7 @@ def guard_against_stale_splits(csv_path: str = CSV_PATH) -> dict:
             "status": "clean",
             "candidates": scan["candidates"],
             "tickers_checked": scan["checked"],
+            "requests": scan["requests"],
             "unverified": scan["unverified"],
         }
 
@@ -802,6 +803,7 @@ def guard_against_stale_splits(csv_path: str = CSV_PATH) -> dict:
         "status": "repaired" if result["repaired"] else "repair_failed",
         "candidates": scan["candidates"],
         "tickers_checked": scan["checked"],
+        "requests": scan["requests"],
         "stale_found": stale,
         "repaired": result["repaired"],
         "quarantined": quarantine,
@@ -834,7 +836,10 @@ def _print_summary(summary: dict, title: str = "SUMMARY") -> None:
         quarantined = guard.get("quarantined") or []
         print(f"  Split guard         : {guard.get('status', 'n/a')} "
               f"({guard.get('candidates', 0)} seam(s) seen, "
-              f"{guard.get('tickers_checked', 0)} verified)")
+              f"{guard.get('tickers_checked', 0)} verified in "
+              f"{guard.get('requests', 0)} request(s))")
+        if guard.get("unverified"):
+            print(f"    ↳ unsettled      : {', '.join(guard['unverified'])}")
         if repaired:
             print(f"    ↳ repaired        : {', '.join(repaired)}")
         if quarantined:

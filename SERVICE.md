@@ -103,12 +103,25 @@ of which happened.
 ```
   scan stored closes for split-shaped one-day jumps      free, no network
         │
-        └─► refetch the two bars either side of each     ~1 request per candidate,
-            and compare against what is stored            cached after the first
+        └─► refetch the bars either side of each seam    batched, ~1 request per
+            and compare against what is stored           50 candidates, then cached
                   │
                   ├─ ratios agree ──► a real crash, remembered, never re-checked
                   └─ ratios differ ─► re-download that ticker from START_DATE
 ```
+
+Both stages go through `_download_batch_with_retry()`, so they inherit the
+retry, exponential backoff and per-ticker fallback the bulk path already had.
+Verification is batched because it is the throttle-exposed stage: it runs
+before any repair, and on a cold cache it has the whole candidate list to get
+through. A sweep of 37 candidates costs one request, not 37.
+
+If a batch still cannot be settled, those tickers are left **in** the reports
+rather than quarantined, and retried next run. That is deliberate: ~95% of
+candidates are genuine crashes, so dropping them on a failed request would
+silently bury exactly the dips the report exists to surface. A failed
+verification never writes a "clean" verdict either, so a throttling episode
+cannot suppress a real split permanently.
 
 Repair rewrites the ticker's whole history, because a partial refetch would
 just move the seam to the start of the refetched window. Anything confirmed

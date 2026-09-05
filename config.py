@@ -100,7 +100,14 @@ SPLIT_VERIFY_TOLERANCE = 0.10
 # two bars are still in range across weekends and holidays.
 SPLIT_VERIFY_WINDOW_DAYS = 7
 
-# Pause between per-ticker verification fetches, to stay under Yahoo's limits.
+# Tickers per verification request. Verification runs before any repair and on
+# a cold cache, so it is the stage most exposed to throttling; batching turns a
+# universe-wide sweep into a handful of requests instead of one per candidate.
+# It goes through the downloader's retrying batch path, which falls back to
+# individual downloads if a whole batch keeps failing.
+SPLIT_VERIFY_BATCH_SIZE = BATCH_SIZE
+
+# Pause between verification batches, to stay under Yahoo's limits.
 SPLIT_VERIFY_SLEEP = 0.4
 
 # How long a "this seam is a genuine price move" verdict stays cached. Without
