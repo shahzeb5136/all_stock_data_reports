@@ -84,6 +84,43 @@ Refresh the seed occasionally so a rebuilt volume has less to catch up on:
 curl -X POST "https://<service>/api/admin/seed/backup?key=<ADMIN_SECRET_KEY>"
 ```
 
+### Stock splits
+
+Incremental updates have one failure mode, and it is not obvious. Yahoo
+re-adjusts a ticker's **entire** history the moment that ticker splits: after a
+2-for-1, every historical bar it serves comes back halved. `smart_update()`
+only ever fetches days it is missing, so the rows already on the volume keep
+the old scale and the CSV ends up carrying two price scales stitched together.
+
+The join is a synthetic one-day cliff, and nothing else catches it — the rows
+are present, positive and evenly spaced, so every other validation check
+passes. The analysers read it as a real crash. Amphenol's 2-for-1 put APH at
+the top of the dip report with a -51% "30-day return" and a -6.6 z-score, none
+of which happened.
+
+`smart_update()` therefore ends with a split guard (see `split_guard.py`):
+
+```
+  scan stored closes for split-shaped one-day jumps      free, no network
+        │
+        └─► refetch the two bars either side of each     ~1 request per candidate,
+            and compare against what is stored            cached after the first
+                  │
+                  ├─ ratios agree ──► a real crash, remembered, never re-checked
+                  └─ ratios differ ─► re-download that ticker from START_DATE
+```
+
+Repair rewrites the ticker's whole history, because a partial refetch would
+just move the seam to the start of the refetched window. Anything confirmed
+stale but not repaired — a failed download, or more than
+`MAX_AUTO_REPAIRS_PER_RUN` of them — is written to a quarantine file beside the
+CSV, and the analysers drop those tickers rather than publish a number that
+never happened. The next run picks them up again.
+
+Steady state costs nothing: verified-clean seams are cached, so the scan
+finds the same handful of genuine crashes each run and asks Yahoo about none
+of them. Run it by hand with `python main.py repair`.
+
 ## Deploying to Railway
 
 1. **Upload the seed** (above). Do this first.

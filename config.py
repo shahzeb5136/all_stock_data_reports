@@ -66,6 +66,54 @@ MIN_EXPECTED_ROWS_PER_TICKER = 100
 MAX_MISSING_DAYS_PCT = 10
 
 # ─────────────────────────────────────────────
+# SPLIT-ADJUSTMENT GUARD
+# ─────────────────────────────────────────────
+# Incremental updates never refetch old rows, but Yahoo re-adjusts a ticker's
+# whole history when it splits. Without this guard the CSV keeps two price
+# scales stitched together at the split date, and the analysers read the seam
+# as a real crash. See split_guard.py for how detection works.
+
+# Run the guard automatically at the end of every smart_update().
+AUTO_REPAIR_SPLITS = os.getenv("AUTO_REPAIR_SPLITS", "true").lower() != "false"
+
+# How many recent bars per ticker the seam scan looks at. 1100 trading days
+# (~4.4 years) comfortably covers the deepest report lookback, the 3-year
+# stable-growth window. Older seams cannot change a published number, and
+# verifying them would spend requests for nothing. Set to 0 to scan everything.
+SPLIT_SCAN_LOOKBACK_ROWS = 1100
+
+# How close a one-day jump must sit to a split ratio to be worth verifying.
+# Generous on purpose: the seam day carries a real day of trading on top of
+# the split, so the ratio is (1 + daily_return) / split_ratio, not the split
+# ratio itself. False positives here cost one request; a false negative would
+# leave a corrupted report.
+SPLIT_SEAM_BAND = 0.12
+
+# Stage 2 refetches the two bars either side of a seam and compares the fresh
+# one-day ratio with the stored one. Same source, same adjustment basis, so a
+# genuine move reproduces to within rounding; this is the slack allowed before
+# calling the stored history stale. The smallest real split (3-for-2) shows up
+# as a 33% disagreement, so there is a wide margin on either side.
+SPLIT_VERIFY_TOLERANCE = 0.10
+
+# Calendar days of padding either side of a seam when refetching it, so the
+# two bars are still in range across weekends and holidays.
+SPLIT_VERIFY_WINDOW_DAYS = 7
+
+# Pause between per-ticker verification fetches, to stay under Yahoo's limits.
+SPLIT_VERIFY_SLEEP = 0.4
+
+# How long a "this seam is a genuine price move" verdict stays cached. Without
+# an expiry, one bad API reply would suppress a real split forever.
+SPLIT_CLEAN_CACHE_DAYS = 90
+
+# Ceiling on automatic repairs per run. Each repair is a full re-download from
+# START_DATE, so a detector gone wrong must not be able to trigger hundreds of
+# them against a rate-limited host. Anything over the cap is quarantined
+# instead: excluded from reports, and repaired on the next run.
+MAX_AUTO_REPAIRS_PER_RUN = 25
+
+# ─────────────────────────────────────────────
 # OUTPUT PATHS
 # ─────────────────────────────────────────────
 # CSV data file. Defaults to the repo-relative path used by local runs; the

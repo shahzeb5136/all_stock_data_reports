@@ -2,14 +2,20 @@
 Core download logic — OHLCV Edition (CSV-only).
 
 Downloads Open, High, Low, Close, Volume for every ticker.
-All price columns are split- and dividend-adjusted (auto_adjust=True).
+Every download is split- and dividend-adjusted (auto_adjust=True) *as of the
+moment it runs* — which is exactly why repair_tickers() has to exist. Yahoo
+re-adjusts a ticker's entire history when it splits, but an incremental update
+only ever fetches new days, so rows written before a split keep the old price
+scale forever. See split_guard.py.
 
-Two main functions:
+Three main functions:
   - bulk_download()   : fetches full history from START_DATE for all tickers
   - smart_update()    : fetches only missing/new data since last CSV entry
-                        (works whether run daily, weekly, or monthly)
+                        (works whether run daily, weekly, or monthly), then
+                        repairs any ticker left on a stale split scale
+  - repair_tickers()  : re-downloads full history for specific tickers
 
-Both write directly to CSV — no database involved.
+All write directly to CSV — no database involved.
 """
 
 import time
@@ -36,9 +42,18 @@ from config import (
     FLUSH_EVERY_N_BATCHES,
     MIN_EXPECTED_ROWS_PER_TICKER,
     MAX_MISSING_DAYS_PCT,
+    AUTO_REPAIR_SPLITS,
+    MAX_AUTO_REPAIRS_PER_RUN,
+    SPLIT_SCAN_LOOKBACK_ROWS,
     LOG_LEVEL,
     LOG_FORMAT,
     LOG_DATE_FORMAT,
+)
+from split_guard import (
+    find_seam_candidates,
+    load_quarantine,
+    save_quarantine,
+    scan_for_stale_splits,
 )
 
 # ─────────────────────────────────────────────
@@ -101,6 +116,32 @@ def _upsert_to_csv(new_df: pd.DataFrame, csv_path: str = CSV_PATH) -> int:
         mask = ~key.isin(new_key)
         combined = pd.concat(
             [existing[mask], new_df[CSV_COLUMNS]], ignore_index=True
+        )
+
+    _save_csv(combined, csv_path)
+    return len(new_df)
+
+
+def _replace_ticker_history(new_df: pd.DataFrame, csv_path: str = CSV_PATH) -> int:
+    """
+    Swap in a freshly downloaded history, dropping every stored row for those
+    tickers first. Returns the number of rows written.
+
+    Repair cannot use _upsert_to_csv(): that merges on (ticker, date), so any
+    stored row the fresh download no longer covers would survive on the old
+    adjustment scale and open a brand-new seam a day wide.
+    """
+    if new_df.empty:
+        return 0
+
+    existing = _load_csv(csv_path)
+    if existing.empty:
+        combined = new_df[CSV_COLUMNS].copy()
+    else:
+        targets = set(new_df["ticker"].unique())
+        combined = pd.concat(
+            [existing[~existing["ticker"].isin(targets)], new_df[CSV_COLUMNS]],
+            ignore_index=True,
         )
 
     _save_csv(combined, csv_path)
@@ -359,6 +400,32 @@ def validate_data(csv_path: str = CSV_PATH) -> dict:
 
         results["ticker_details"][ticker] = detail
 
+    # Check 6: split-shaped price discontinuities.
+    # A stale split adjustment is invisible to every check above — the rows are
+    # present, positive, and evenly spaced — so it needs its own pass. These
+    # are candidates, not verdicts: most are genuine crashes. Only the guard,
+    # which refetches each seam and compares, can tell the difference.
+    try:
+        seams = find_seam_candidates(df, lookback_rows=SPLIT_SCAN_LOOKBACK_ROWS)
+    except Exception as e:
+        log.warning(f"Discontinuity check failed: {e}")
+        seams = []
+
+    quarantined = load_quarantine(csv_path)
+    if quarantined:
+        msg = (f"{len(quarantined)} ticker(s) quarantined for stale split "
+               f"adjustment (excluded from reports): {sorted(quarantined)}")
+        results["errors"].append(msg)
+    if seams:
+        by_ticker = sorted({s["ticker"] for s in seams})
+        msg = (f"{len(seams)} split-shaped price jump(s) across "
+               f"{len(by_ticker)} ticker(s) — run 'python main.py repair' to "
+               f"refetch and settle them: {by_ticker[:10]}"
+               f"{'...' if len(by_ticker) > 10 else ''}")
+        results["warnings"].append(msg)
+    results["price_discontinuities"] = seams
+    results["quarantined_tickers"] = sorted(quarantined)
+
     results["status"] = "clean" if not results["errors"] else "has_errors"
     return results
 
@@ -601,6 +668,13 @@ def smart_update(
     else:
         total_rows = 0
 
+    # ── Split guard ──
+    # Must run after the save: the new rows are what expose a split, and the
+    # scan reads the CSV.
+    split_summary = {}
+    if AUTO_REPAIR_SPLITS:
+        split_summary = guard_against_stale_splits(csv_path=CSV_PATH)
+
     elapsed = time.time() - t_start
 
     # ── Summary ──
@@ -613,6 +687,7 @@ def smart_update(
         "tickers_failed": len(all_failed),
         "failed_tickers": all_failed,
         "rows_written": total_rows,
+        "split_guard": split_summary,
         "elapsed": _format_elapsed(elapsed),
     }
     _print_summary(summary, title="UPDATE COMPLETE")
@@ -621,6 +696,117 @@ def smart_update(
 
 # Backward compatibility alias
 daily_update = smart_update
+
+
+# ─────────────────────────────────────────────
+# SPLIT REPAIR
+# ─────────────────────────────────────────────
+
+def repair_tickers(tickers: list, reason: str = "stale split adjustment") -> dict:
+    """
+    Re-download the full history for specific tickers and replace their rows.
+
+    Always refetches from START_DATE. A shorter refetch would only move the
+    seam to the start of the refetched window, since everything before it
+    would still sit on the old adjustment scale.
+
+    Returns {'repaired': [...], 'failed': [...], 'rows_written': int}.
+    """
+    tickers = sorted({t.upper() for t in (tickers or [])})
+    if not tickers:
+        return {"repaired": [], "failed": [], "rows_written": 0}
+
+    today = datetime.today().strftime("%Y-%m-%d")
+    log.info(f"REPAIR: re-downloading {len(tickers)} ticker(s) "
+             f"from {START_DATE} - {reason}")
+
+    frames, failed = [], []
+    batches = list(_chunked(tickers, BATCH_SIZE))
+    for i, batch in enumerate(batches, 1):
+        df, batch_failed = _download_batch_with_retry(
+            batch, START_DATE, today,
+            label=f"repair {i}/{len(batches)}",
+            sleep_seconds=SLEEP_BETWEEN_BATCHES,
+        )
+        if not df.empty:
+            frames.append(df)
+        failed.extend(batch_failed)
+        if i < len(batches):
+            time.sleep(SLEEP_BETWEEN_BATCHES)
+
+    if not frames:
+        log.error(f"REPAIR: no data returned for any of {tickers}")
+        return {"repaired": [], "failed": tickers, "rows_written": 0}
+
+    combined = pd.concat(frames, ignore_index=True)
+    repaired = sorted(set(combined["ticker"].unique()))
+    rows = _replace_ticker_history(combined)
+
+    still_failed = sorted(set(tickers) - set(repaired))
+    if still_failed:
+        log.error(f"REPAIR: no data for {still_failed} - left unrepaired")
+    log.info(f"REPAIR: rewrote {rows:,} rows for {len(repaired)} ticker(s)")
+
+    return {"repaired": repaired, "failed": still_failed, "rows_written": rows}
+
+
+def guard_against_stale_splits(csv_path: str = CSV_PATH) -> dict:
+    """
+    Find any history left on a stale split scale and re-download it.
+
+    Runs at the end of every incremental update, because a split that lands
+    today corrupts today's reports, and the seam it leaves is visible the
+    moment the post-split rows are written.
+
+    Tickers that are confirmed stale but could not be repaired — a failed
+    download, or more of them than MAX_AUTO_REPAIRS_PER_RUN allows — are
+    quarantined instead, so the analysers drop them rather than publish a
+    -51% "return" that never happened. The next run picks them up again.
+    """
+    try:
+        df = _load_csv(csv_path)
+        scan = scan_for_stale_splits(df, csv_path=csv_path)
+        del df
+    except Exception:
+        log.exception("Split guard: scan failed - skipping repair this run")
+        return {"status": "scan_failed"}
+
+    # Retry anything an earlier run quarantined, even if its seam has since
+    # aged out of the scan window.
+    stale = sorted(set(scan["tickers"]) | load_quarantine(csv_path))
+    if not stale:
+        if load_quarantine(csv_path):
+            save_quarantine([], csv_path)
+        return {
+            "status": "clean",
+            "candidates": scan["candidates"],
+            "tickers_checked": scan["checked"],
+            "unverified": scan["unverified"],
+        }
+
+    to_repair, deferred = stale[:MAX_AUTO_REPAIRS_PER_RUN], stale[MAX_AUTO_REPAIRS_PER_RUN:]
+    if deferred:
+        log.warning(f"Split guard: {len(deferred)} ticker(s) over the "
+                    f"{MAX_AUTO_REPAIRS_PER_RUN}-repair cap, deferred to the "
+                    f"next run: {deferred}")
+
+    result = repair_tickers(to_repair, reason="stale split adjustment")
+    quarantine = sorted(set(result["failed"]) | set(deferred))
+    save_quarantine(quarantine, csv_path)
+
+    if quarantine:
+        log.warning(f"Split guard: quarantined {len(quarantine)} ticker(s) - "
+                    f"excluded from reports until repaired: {quarantine}")
+
+    return {
+        "status": "repaired" if result["repaired"] else "repair_failed",
+        "candidates": scan["candidates"],
+        "tickers_checked": scan["checked"],
+        "stale_found": stale,
+        "repaired": result["repaired"],
+        "quarantined": quarantine,
+        "unverified": scan["unverified"],
+    }
 
 
 def _print_summary(summary: dict, title: str = "SUMMARY") -> None:
@@ -641,6 +827,19 @@ def _print_summary(summary: dict, title: str = "SUMMARY") -> None:
 
     print(f"  Failed              : {summary.get('tickers_failed', 0)}")
     print(f"  Rows written        : {summary.get('rows_written', 0):,}")
+
+    guard = summary.get("split_guard") or {}
+    if guard:
+        repaired = guard.get("repaired") or []
+        quarantined = guard.get("quarantined") or []
+        print(f"  Split guard         : {guard.get('status', 'n/a')} "
+              f"({guard.get('candidates', 0)} seam(s) seen, "
+              f"{guard.get('tickers_checked', 0)} verified)")
+        if repaired:
+            print(f"    ↳ repaired        : {', '.join(repaired)}")
+        if quarantined:
+            print(f"    ↳ quarantined     : {', '.join(quarantined)}")
+
     print(f"  Elapsed time        : {summary.get('elapsed', 'N/A')}")
 
     if summary.get("failed_tickers"):

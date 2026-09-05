@@ -27,6 +27,7 @@ extreme multi-year runners from dominating the list.
 """
 
 import os
+import sys
 import pandas as pd
 import numpy as np
 import warnings
@@ -36,10 +37,31 @@ warnings.filterwarnings("ignore")
 
 _SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 
+# Tickers the downloader could not lift off a stale split adjustment. This
+# report is the more exposed of the two: an unrepaired 1-for-10 reverse split
+# reads as a +900% one-day gain, which outranks every genuine breakout — and
+# reverse splits cluster in exactly the distressed names you least want here.
+_REPO_ROOT = os.path.dirname(_SCRIPT_DIR)
+if _REPO_ROOT not in sys.path:
+    sys.path.insert(0, _REPO_ROOT)
+try:
+    from split_guard import load_quarantine
+except Exception:
+    def load_quarantine(csv_path=None):
+        return set()
+
+
 def load_data(path=None):
     if path is None:
         path = os.path.join(_SCRIPT_DIR, "stock_prices.csv")
     df = pd.read_csv(path, parse_dates=["date"])
+
+    quarantined = load_quarantine(path) & set(df["ticker"].unique())
+    if quarantined:
+        print(f"  [!] Excluding {len(quarantined)} ticker(s) with a stale split "
+              f"adjustment: {', '.join(sorted(quarantined))}")
+        df = df[~df["ticker"].isin(quarantined)]
+
     df.sort_values(["ticker", "date"], inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df

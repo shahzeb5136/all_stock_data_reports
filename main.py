@@ -6,6 +6,8 @@ Stock Price Downloader — Main Entry Point (OHLCV Edition)
 Usage:
     python main.py bulk       Full historical download from 2005 (initial load)
     python main.py update     Smart incremental update (fetches only missing data)
+    python main.py repair     Find and re-download history stuck on a stale
+                              split adjustment (add tickers to force specific ones)
     python main.py query AAPL Query a specific ticker from the CSV
     python main.py stats      Show CSV statistics
     python main.py validate   Run data quality checks on the CSV
@@ -16,6 +18,12 @@ Examples:
 
     # Any time after that — grab only new data since last run:
     python main.py update
+
+    # Fix a ticker whose prices halved overnight because it split:
+    python main.py repair APH
+
+    # Or sweep the whole universe for stale split adjustments:
+    python main.py repair
 
     # Pull data for one ticker:
     python main.py query AAPL
@@ -31,6 +39,8 @@ from config import CSV_PATH, ALL_TICKERS, TOP_TICKERS, START_DATE
 from downloader import (
     bulk_download,
     smart_update,
+    repair_tickers,
+    guard_against_stale_splits,
     query_csv,
     validate_data,
     print_validation_report,
@@ -52,6 +62,37 @@ def cmd_update():
     print(f"  Tickers: {len(ALL_TICKERS)}")
     print("=" * 60)
     smart_update()
+
+
+def cmd_repair(tickers: list):
+    print("=" * 60)
+    if tickers:
+        print("REPAIR — Forced re-download")
+        print(f"  Tickers: {', '.join(tickers)}")
+        print("=" * 60)
+        result = repair_tickers(tickers, reason="requested from the CLI")
+        print(f"\n  Repaired : {', '.join(result['repaired']) or 'none'}")
+        print(f"  Failed   : {', '.join(result['failed']) or 'none'}")
+        print(f"  Rows     : {result['rows_written']:,}\n")
+        return
+
+    print("REPAIR — Scanning for stale split adjustments")
+    print("=" * 60)
+    result = guard_against_stale_splits()
+
+    if result.get("status") == "scan_failed":
+        print("\n  Scan failed — see the log above.\n")
+        return
+
+    print(f"\n  Split-shaped seams  : {result.get('candidates', 0)}")
+    print(f"  Refetched to verify : {result.get('tickers_checked', 0)}")
+    print(f"  Stale histories     : {', '.join(result.get('stale_found', [])) or 'none'}")
+    print(f"  Repaired            : {', '.join(result.get('repaired', [])) or 'none'}")
+    if result.get("quarantined"):
+        print(f"  Quarantined         : {', '.join(result['quarantined'])}")
+    if result.get("unverified"):
+        print(f"  Could not verify    : {', '.join(result['unverified'])}")
+    print()
 
 
 def cmd_query(ticker: str):
@@ -110,6 +151,8 @@ def main():
         cmd_bulk()
     elif command == "update":
         cmd_update()
+    elif command == "repair":
+        cmd_repair([t.upper() for t in sys.argv[2:]])
     elif command == "query":
         if len(sys.argv) < 3:
             print("Usage: python main.py query <TICKER>")

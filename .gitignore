@@ -4,6 +4,10 @@
 *.csv
 *.tsv
 
+# Split-guard state, written beside the CSV it describes (see split_guard.py).
+*.splitcache.json
+*.quarantine.json
+
 # ── Generated report artifacts ──────────────────────────────────────────────
 # PDFs and chart PNGs are rebuilt on every run.
 *.pdf

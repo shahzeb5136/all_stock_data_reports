@@ -41,6 +41,24 @@ TOP_N = 20
 # DATA LOADING
 # ──────────────────────────────────────────────────────────────────────
 
+def _quarantined_tickers(csv_path):
+    """
+    Tickers flagged by the downloader as sitting on a stale split adjustment.
+
+    Imported defensively, and with the repo root pushed onto sys.path, so a
+    direct `python reports/stable_growth_report.py` still runs even though only
+    reports/ is on the path then.
+    """
+    repo_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+    try:
+        from split_guard import load_quarantine
+        return load_quarantine(csv_path)
+    except Exception:
+        return set()
+
+
 def load_csv(filepath):
     print(f"📥 Loading data from {filepath}...")
     with open(filepath, "r") as f:
@@ -61,6 +79,16 @@ def load_csv(filepath):
 
     prices = df.pivot_table(index="date", columns="ticker", values="price", aggfunc="last")
     prices = prices.sort_index().ffill()
+
+    # Drop anything the downloader could not lift off a stale split adjustment.
+    # Here the damage is a silent false negative rather than a bad pick: one
+    # synthetic -50% day wrecks the volatility, Sharpe and drawdown terms, so a
+    # genuinely stable compounder would simply vanish from the ranking.
+    quarantined = _quarantined_tickers(filepath) & set(prices.columns)
+    if quarantined:
+        print(f"[!] Excluding {len(quarantined)} ticker(s) with a stale split "
+              f"adjustment: {', '.join(sorted(quarantined))}")
+        prices = prices.drop(columns=sorted(quarantined))
 
     print(f"✅ Loaded {prices.shape[1]} tickers, {prices.shape[0]} trading days")
     print(f"   Date range: {prices.index[0].strftime('%Y-%m-%d')} → {prices.index[-1].strftime('%Y-%m-%d')}")

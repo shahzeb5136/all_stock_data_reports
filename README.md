@@ -24,9 +24,26 @@ python main.py update
 |---|---|
 | `python main.py bulk` | Full historical download from 2005 (initial load) |
 | `python main.py update` | Incremental daily update (fast) |
+| `python main.py repair` | Find and fix history stuck on a stale split adjustment |
+| `python main.py repair APH` | Force a full re-download of specific tickers |
 | `python main.py export` | Re-export DB → CSV |
 | `python main.py query AAPL` | Print data for one ticker (last 20 rows) |
 | `python main.py stats` | Show DB summary |
+| `python main.py validate` | Data quality checks, including split discontinuities |
+
+## Stock Splits
+
+Every download is adjusted **as of the moment it runs** — which is the catch.
+Yahoo re-adjusts a ticker's entire history when it splits, but `update` only
+fetches days it is missing, so older rows keep the pre-split scale and the file
+ends up with two price scales joined at a synthetic one-day cliff. A 2-for-1
+reads as a -50% crash; a 1-for-10 reverse split reads as a +900% surge.
+
+`update` now ends with a guard that scans for those seams, refetches the ones
+that look like splits to tell a real crash from a stale scale, and re-downloads
+any ticker that is genuinely stale. It is cached, so ordinary crashes are
+checked once and then ignored. `python main.py repair` runs the same sweep on
+demand. See `split_guard.py` for the details.
 
 ## Data Fields
 
