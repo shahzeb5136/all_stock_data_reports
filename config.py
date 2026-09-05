@@ -76,6 +76,15 @@ MAX_MISSING_DAYS_PCT = 10
 # Run the guard automatically at the end of every smart_update().
 AUTO_REPAIR_SPLITS = os.getenv("AUTO_REPAIR_SPLITS", "true").lower() != "false"
 
+# Ratios worth treating as split-shaped, forward and reverse. Anything below
+# 3-for-2 is not a split any exchange actually runs, and would drown the scan
+# in ordinary volatility. Lives here rather than in split_guard so the API can
+# reuse it without importing pandas — the API process is deliberately kept
+# clear of the price stack (see api/main.py, admin_price).
+COMMON_SPLIT_RATIOS = (
+    1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 15.0, 20.0, 25.0, 30.0,
+)
+
 # How many recent bars per ticker the seam scan looks at. 1100 trading days
 # (~4.4 years) comfortably covers the deepest report lookback, the 3-year
 # stable-growth window. Older seams cannot change a published number, and

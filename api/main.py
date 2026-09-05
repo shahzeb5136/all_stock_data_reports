@@ -35,6 +35,10 @@ from api.settings import (
     allowed_origins,
     ensure_dirs,
 )
+
+# Import-light on purpose: config pulls in nothing but os and logging, so the
+# API keeps its pandas-free footprint. See the price-inspection helpers below.
+from config import COMMON_SPLIT_RATIOS, SPLIT_SCAN_LOOKBACK_ROWS, SPLIT_SEAM_BAND
 from api.storage import get_download_url, upload_file
 
 logger = logging.getLogger(__name__)
@@ -88,6 +92,120 @@ async def get_current_user(authorization: Optional[str] = Header(None)) -> str:
 def require_admin(key: str) -> None:
     if not ADMIN_SECRET_KEY or key != ADMIN_SECRET_KEY:
         raise HTTPException(status_code=403, detail="Forbidden")
+
+
+# ── Price CSV inspection ─────────────────────────────────────────────────────
+# Everything here is deliberately pure Python. The API process is kept clear of
+# the price stack — the build runs in a subprocess precisely because pandas
+# holds the full history in over a gigabyte — and importing split_guard here
+# would drag pandas and numpy into the API for the life of the process. The
+# split ratios come from config, which is import-light, so nothing is
+# duplicated.
+
+def _read_ticker_rows(ticker: str) -> List[Dict[str, Any]]:
+    """Stream the price CSV and return just this ticker's bars.
+
+    Never loads the whole file: it reads line by line and keeps only matching
+    rows (a few thousand at most). The CSV is written sorted by ticker then
+    date by downloader._save_csv(), so the scan can stop as soon as it reads
+    past the block it wants.
+    """
+    import csv
+
+    if not CSV_PATH.exists():
+        raise HTTPException(status_code=503, detail=f"No price CSV at {CSV_PATH}")
+
+    rows: List[Dict[str, Any]] = []
+    try:
+        with CSV_PATH.open("r", newline="", encoding="utf-8") as fh:
+            reader = csv.reader(fh)
+            header = next(reader, None)
+            if not header or "ticker" not in header:
+                raise HTTPException(status_code=500, detail="Price CSV has no ticker column")
+
+            cols = {name: i for i, name in enumerate(header)}
+            t_i, seen = cols["ticker"], False
+
+            for parts in reader:
+                if len(parts) <= t_i:
+                    continue
+                if parts[t_i] != ticker:
+                    if seen:
+                        break  # sorted by ticker, so the block is done
+                    continue
+                seen = True
+                rows.append({
+                    "date": parts[cols["date"]] if "date" in cols else None,
+                    "open": _to_float(parts, cols.get("open")),
+                    "high": _to_float(parts, cols.get("high")),
+                    "low": _to_float(parts, cols.get("low")),
+                    "close": _to_float(parts, cols.get("close")),
+                    "volume": _to_float(parts, cols.get("volume")),
+                })
+    except HTTPException:
+        raise
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read price CSV: {exc}")
+
+    return rows
+
+
+def _to_float(parts: List[str], index: Optional[int]) -> Optional[float]:
+    if index is None or index >= len(parts):
+        return None
+    try:
+        return float(parts[index])
+    except (TypeError, ValueError):
+        return None
+
+
+def _nearest_split_ratio(ratio: float) -> Optional[float]:
+    """The common split ratio this one-day move sits closest to, if any."""
+    if ratio <= 0:
+        return None
+    best: Optional[tuple] = None
+    for base in COMMON_SPLIT_RATIOS:
+        for cand in (base, 1.0 / base):
+            rel = abs(ratio - cand) / cand
+            if rel <= SPLIT_SEAM_BAND and (best is None or rel < best[1]):
+                best = (cand, rel)
+    return best[0] if best else None
+
+
+def _describe_split(snapped_ratio: float) -> str:
+    """Name the split a seam implies. Takes the *snapped* ratio.
+
+    Must be given the value from _nearest_split_ratio(), not the raw observed
+    jump: the seam day carries a real day of trading on top of the split, so
+    the raw ratio is a few percent off and would render as "99-for-10".
+
+    A stale seam runs the split backwards — a 10-for-1 leaves a one-day jump
+    of about 1/10 — so the implied split ratio is the reciprocal. Expressed as
+    a fraction so the odd ones read the way the market writes them: a 0.667
+    seam is a 3-for-2, not a "1.5-for-1".
+    """
+    from fractions import Fraction
+
+    if snapped_ratio <= 0:
+        return "unknown"
+    implied = Fraction(1 / snapped_ratio).limit_denominator(30)
+    label = f"{implied.numerator}-for-{implied.denominator}"
+    return f"{label} split" if implied >= 1 else f"{label} reverse split"
+
+
+def _quarantined_tickers() -> set:
+    """Read the split guard's quarantine file, which sits beside the CSV."""
+    import json
+
+    path = CSV_PATH.with_name(f"{CSV_PATH.stem}.quarantine.json")
+    try:
+        if not path.exists():
+            return set()
+        with path.open("r", encoding="utf-8") as fh:
+            return set(json.load(fh).get("tickers", []))
+    except Exception:
+        logger.warning("Could not read quarantine file at %s", path)
+        return set()
 
 
 # ── Serialisation helpers ────────────────────────────────────────────────────
@@ -321,6 +439,67 @@ async def admin_status(key: str):
             "exists": csv_exists,
             "megabytes": round(CSV_PATH.stat().st_size / (1024 * 1024), 1) if csv_exists else 0,
         },
+    }
+
+
+@app.get("/api/admin/price/{ticker}")
+async def admin_price(ticker: str, key: str, limit: int = 20):
+    """Recent stored bars for one ticker, straight off the volume.
+
+    Exists to answer "did the split guard actually fix this?" without an SSH
+    session. ``suspect_jumps`` re-runs the guard's seam test over the same
+    window it uses, so a stale split shows up here as plainly as it would in
+    the report.
+    """
+    require_admin(key)
+
+    ticker = ticker.upper().strip()
+    limit = max(1, min(limit, 500))
+
+    rows = _read_ticker_rows(ticker)
+    if not rows:
+        raise HTTPException(status_code=404, detail=f"No rows for {ticker}")
+
+    # Same window the guard scans, so this endpoint and the guard agree.
+    window = rows[-(SPLIT_SCAN_LOOKBACK_ROWS + 1):] if SPLIT_SCAN_LOOKBACK_ROWS else rows
+
+    suspect = []
+    for prev, cur in zip(window, window[1:]):
+        if not prev["close"] or not cur["close"]:
+            continue
+        ratio = cur["close"] / prev["close"]
+        nearest = _nearest_split_ratio(ratio)
+        if nearest:
+            suspect.append({
+                "prev_date": prev["date"],
+                "date": cur["date"],
+                "prev_close": prev["close"],
+                "close": cur["close"],
+                "change_pct": round((ratio - 1) * 100, 2),
+                "looks_like": _describe_split(nearest),
+            })
+
+    # change_pct is measured against the bar before, which for the first row
+    # shown is the one just outside the window — so every displayed row has a
+    # real number, and a split cliff cannot hide on the window boundary.
+    tail = rows[-limit:]
+    offset = len(rows) - len(tail)
+    recent = []
+    for i, cur in enumerate(tail):
+        prev = rows[offset + i - 1] if offset + i > 0 else None
+        change = None
+        if prev and prev["close"] and cur["close"]:
+            change = round((cur["close"] / prev["close"] - 1) * 100, 2)
+        recent.append({**cur, "change_pct": change})
+
+    return {
+        "ticker": ticker,
+        "csv_path": str(CSV_PATH),
+        "rows_stored": len(rows),
+        "date_range": [rows[0]["date"], rows[-1]["date"]],
+        "quarantined": ticker in _quarantined_tickers(),
+        "suspect_jumps": suspect,
+        "recent": recent,
     }
 
 

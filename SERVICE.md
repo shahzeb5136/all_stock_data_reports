@@ -272,6 +272,40 @@ the user does not own it.
 
 `{ "credits": 18 }` — the shared balance, same number trading_agents shows.
 
+### `GET /api/admin/price/{ticker}` — admin
+
+Recent stored bars for one ticker, read straight off the volume. Exists to
+answer "did the split guard actually fix this?" without an SSH session:
+
+```json
+{
+  "ticker": "APH",
+  "rows_stored": 5433,
+  "date_range": ["2005-01-03", "2026-09-04"],
+  "quarantined": false,
+  "suspect_jumps": [
+    {"prev_date": "...", "date": "...", "change_pct": -50.0,
+     "looks_like": "2-for-1 split"}
+  ],
+  "recent": [{"date": "...", "close": 80.04, "change_pct": 1.2, "...": "..."}]
+}
+```
+
+`suspect_jumps` re-runs the guard's seam test over the same window the guard
+uses, so this endpoint and the guard always agree. An empty list plus a smooth
+`change_pct` column means the history is on one scale. Note these are
+candidates, not verdicts — a genuine -33% crash shows up here too, exactly as
+it does for the guard, which is why the guard refetches before repairing.
+
+`?limit=` controls how many bars come back (default 20, max 500).
+
+It reads the CSV by streaming, keeping only the one ticker's rows, and stops
+early because the file is sorted by ticker. That matters: the API process is
+deliberately kept clear of the price stack — the build runs in a subprocess
+because pandas holds the full history in over a gigabyte — so this endpoint is
+pure Python and never imports pandas. Cost is a linear scan: ~0.6s for a
+ticker near the start of the alphabet, ~9s for one at the end.
+
 ### Admin — `?key=<ADMIN_SECRET_KEY>`
 
 | Endpoint | Purpose |

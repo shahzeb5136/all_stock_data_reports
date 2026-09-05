@@ -69,6 +69,7 @@ import numpy as np
 import pandas as pd
 
 from config import (
+    COMMON_SPLIT_RATIOS,
     CSV_PATH,
     SLEEP_BETWEEN_BATCHES_UPDATE,
     SPLIT_CLEAN_CACHE_DAYS,
@@ -82,12 +83,10 @@ from config import (
 
 log = logging.getLogger("split_guard")
 
-# Ratios worth treating as split-shaped, forward and reverse. Anything below
-# 3-for-2 is not a split any exchange actually runs, and would drown the scan
-# in ordinary volatility.
-COMMON_SPLIT_RATIOS = (
-    1.5, 2.0, 2.5, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0, 15.0, 20.0, 25.0, 30.0,
-)
+# COMMON_SPLIT_RATIOS lives in config so the API can share it without pulling
+# pandas in; re-exported here because this is where it is conceptually owned.
+__all__ = ["COMMON_SPLIT_RATIOS", "find_seam_candidates", "confirm_split_seams",
+           "scan_for_stale_splits", "load_quarantine", "save_quarantine"]
 
 
 def _candidate_ratios() -> np.ndarray:
